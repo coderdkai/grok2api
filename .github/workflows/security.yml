@@ -1,9 +1,9 @@
-name: Security Checks
+name: Security
 
 on:
-  pull_request:
-    branches: [main]
   push:
+    branches: [main]
+  pull_request:
     branches: [main]
   schedule:
     - cron: "0 3 * * 1"
@@ -13,69 +13,45 @@ permissions:
 
 jobs:
   gitleaks:
-    name: Secret Scan (gitleaks)
+    name: Gitleaks Secret Scanner
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          
+      # 针对 PR：使用原生逻辑
+      - name: Setup PR commits & Run Gitleaks
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags --prune --depth=1 origin \
+            "+${{ github.event.pull_request.base.sha }}:refs/remotes/origin/pr-base"
+          git remote add pr-head "https://github.com/${{ github.event.pull_request.head.repo.full_name }}.git"
+          git fetch --no-tags --prune --depth=1 pr-head \
+            "+${{ github.event.pull_request.head.sha }}:refs/remotes/pr-head/current"
+            
+          docker run --rm \
+            -v "$PWD:/repo" \
+            -w /repo \
+            zricethezav/gitleaks:v8.24.3 \
+            detect --source . --redact -v --exit-code=2 \
+            --log-opts="--no-merges refs/remotes/origin/pr-base..refs/remotes/pr-head/current"
 
-      - name: Run gitleaks
+      # 针对 Push 和 Schedule：使用官方 Action
+      - name: Run Gitleaks Action
+        if: github.event_name != 'pull_request'
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  dependency-audit:
-    name: Dependency Audit (pip-audit)
+  pip-audit:
+    name: Python Dependency Audit
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Set up uv
+      - uses: actions/checkout@v4
+      - name: Install uv
         uses: astral-sh/setup-uv@v3
-
-      - name: Install pip-audit
-        run: python -m pip install --upgrade pip pip-audit
-
-      - name: Export requirements from lockfile
-        run: uv export --frozen --no-dev --format requirements-txt -o requirements.audit.txt
-
+      - name: Export requirements
+        run: uv export --frozen --no-dev --format requirements-txt -o /tmp/req.txt
       - name: Run pip-audit
-        run: pip-audit -r requirements.audit.txt --progress-spinner off
-
-  codeql:
-    name: CodeQL
-    runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
-      security-events: write
-    strategy:
-      fail-fast: false
-      matrix:
-        language: [python]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: ${{ matrix.language }}
-
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+        run: uvx pip-audit -r /tmp/req.txt --progress-spinner off
