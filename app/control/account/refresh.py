@@ -241,6 +241,9 @@ class AccountRefreshService:
         except UpstreamError as exc:
             if await self._expire_invalid_credentials(record, exc):
                 return RefreshResult(checked=1, expired=1, failed=0)
+            # Credentials not confirmed invalid — record failure and check threshold.
+            if await self._record_refresh_failure(record):
+                return RefreshResult(checked=1, expired=1, failed=0)
             raise
 
         # API call completely failed — no real data available.
@@ -365,7 +368,58 @@ class AccountRefreshService:
                 [AccountPatch(token=record.token, **patches)]
             )  # type: ignore[arg-type]
 
+        # Track refresh failure and check fail_threshold.
+        if await self._record_refresh_failure(record):
+            return RefreshResult(checked=1, expired=1, failed=0)
+
         return RefreshResult(checked=1, failed=1)
+
+    async def _record_refresh_failure(self, record: AccountRecord) -> bool:
+        """Increment fail counter and expire account if threshold is exceeded.
+
+        Returns True when the account was expired (caller should return expired result).
+        """
+        from .commands import AccountPatch
+
+        new_fail_count = record.usage_fail_count + 1
+        threshold = int(get_config("token.fail_threshold", 5))
+        ts = now_ms()
+
+        if new_fail_count >= threshold:
+            await self._repo.patch_accounts(
+                [
+                    AccountPatch(
+                        token=record.token,
+                        status=AccountStatus.EXPIRED,
+                        usage_fail_delta=1,
+                        last_fail_at=ts,
+                        last_fail_reason="fail_threshold_exceeded",
+                        state_reason="fail_threshold_exceeded",
+                        ext_merge={
+                            "expired_at": ts,
+                            "expired_reason": "fail_threshold_exceeded",
+                        },
+                    )
+                ]
+            )
+            logger.info(
+                "account expired by fail threshold: token={}... fail_count={} threshold={}",
+                record.token[:10],
+                new_fail_count,
+                threshold,
+            )
+            return True
+
+        await self._repo.patch_accounts(
+            [
+                AccountPatch(
+                    token=record.token,
+                    usage_fail_delta=1,
+                    last_fail_at=ts,
+                )
+            ]
+        )
+        return False
 
     async def record_failure_async(
         self, token: str, mode_id: int, exc: BaseException | None = None
@@ -414,6 +468,11 @@ class AccountRefreshService:
                         ]
                     )
                     return
+            # Record failure and check fail_threshold for non-credential errors.
+            record = next(iter(await self._repo.get_accounts([token])), None)
+            if record is not None:
+                await self._record_refresh_failure(record)
+                return
             await self._repo.patch_accounts(
                 [
                     AccountPatch(

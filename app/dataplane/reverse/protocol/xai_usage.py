@@ -220,6 +220,9 @@ def is_invalid_credentials_error(exc: BaseException) -> bool:
         return False
     if exc.status not in (400, 401, 403):
         return False
+    # 401 always means the session credentials are invalid.
+    if exc.status == 401:
+        return True
     return is_invalid_credentials_body(str(exc.details.get("body", "") or ""))
 
 
